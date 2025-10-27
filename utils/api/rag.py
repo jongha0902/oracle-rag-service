@@ -22,7 +22,7 @@ async def ask_question(
         return JSONResponse(status_code=400, content=res)
 
     # ✅ 실제 응답 처리 (현재는 테스트 응답)
-    #answer = rag_with_ollama(question, query_type)
+    answer = rag_with_ollama(question, query_type)
     answer = "API Gateway Test...."
 
     res = {"answer": answer}
