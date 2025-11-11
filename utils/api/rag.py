@@ -152,7 +152,7 @@ async def ask_question(
     query_type = type.strip()
 
     try:
-        # 🧠 타입 1: 기본 RAG (파일 사용 안 함)
+        # 🧠 타입 1: 전력거래 RAG
         if query_type == "1":
             if not question:
                 raise HTTPException(status_code=400, detail="타입 1은 질문이 필수입니다.")
