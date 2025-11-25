@@ -88,7 +88,7 @@ def create_vectorstore():
 def build_context_for_question(question: str, k=20, score_threshold=0.4):
     # 👈 vectorstore가 None일 때 방어 코드
     if vectorstore is None:
-        return "ERROR: 타입 1 Vectorstore가 로드되지 않았습니다."
+        return "ERROR: 전력거래시장 Vectorstore가 로드되지 않았습니다."
 
     results = vectorstore.similarity_search_with_score(question, k=k)
 
