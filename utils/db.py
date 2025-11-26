@@ -1,7 +1,7 @@
 import sqlite3
 from contextlib import contextmanager
 from utils.config import Config
-
+ 
 DB_PATH = Config.DB_PATH
 
 class DatabaseError(Exception):
