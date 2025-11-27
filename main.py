@@ -17,7 +17,7 @@ from utils.exception_handler import (
 )
 
 from utils.api.rag import router as rag_router
-from utils.ollama_rag import create_vectorstore
+from utils.ollama_rag import initialize_vectorstore
 
 # 🔧 로깅 설정
 logging.basicConfig(level=logging.INFO)
@@ -27,9 +27,8 @@ logger = logging.getLogger(__name__)
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     # ✅ 앱 실행 전에 수행할 초기화 작업
-    logger.info("🚀 앱 시작: DB 및 Vectorstore 초기화 중...")
-    create_vectorstore()      # 벡터스토어 초기화 또는 로드
-
+    logger.info("🚀 앱 시작: DB Vectorstore 초기화 중...")
+    initialize_vectorstore()
     yield  # 👈 여기서 FastAPI 앱이 실행됩니다 (요청 수신 가능 상태로 진입)
 
     # 🛑 앱 종료 직전에 실행할 정리 작업 (옵션)

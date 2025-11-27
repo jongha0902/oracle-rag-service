@@ -1,17 +1,24 @@
+# utils/config.py
+
 import os
 from pydantic_settings import BaseSettings
 
 class Settings(BaseSettings):
-    # 1. 필수 항목 (Default 값을 지움 -> .env에 없으면 에러 발생)
-    # 보안이 필요한 값들은 절대 코드에 적지 않습니다.
-    DB_PATH: str
+    # 1. Oracle 연결 정보
+    ORA_USER: str
+    ORA_PASSWORD: str
+    ORA_DSN: str
+    
+    # 2. Oracle 11g 연결을 위한 Instant Client 경로 (필수)
+    ORA_LIB_DIR: str
+
+    # 3. 벡터 스토어 저장 경로
+    SCHEMA_STORE_PATH: str
 
     class Config:
         env_file = ".env"
         env_file_encoding = "utf-8"
 
-# 인스턴스 생성
-# .env 파일이 없거나, 필수 변수가 빠져있으면 여기서 에러가 발생해서 서버가 안 켜집니다. (안전)
 try:
     Config = Settings()
 except Exception as e:

@@ -1,350 +1,179 @@
-# utils/ollama_rag.py
-
 import os
-import requests
+import shutil
 from langchain_community.embeddings import HuggingFaceEmbeddings
 from langchain_community.vectorstores import FAISS
-from langchain.prompts import PromptTemplate
-from PyPDF2 import PdfReader
-from langchain.text_splitter import RecursiveCharacterTextSplitter
-
-# 경로 설정
-vectorstore_path = "/home/kecpuser/workspace/ollama_fastapi/app/data/vectorstore"
-embedding_model_path = "/home/kecpuser/huggingface/hub/models--intfloat--multilingual-e5-large/snapshots/0dc5580a448e4284468b8909bae50fa925907bc5"
-pdf_path = "/home/kecpuser/workspace/ollama_fastapi/app/data/전력시장운영규칙.pdf"
-txt_path = "/home/kecpuser/workspace/ollama_fastapi/app/data/cleaned_text.txt"
-
-vectorstore = None  # ✅ 전역 vectorstore 선언
+from langchain_community.chat_models import ChatOllama
+from langchain_core.prompts import ChatPromptTemplate, MessagesPlaceholder
+from langchain_core.runnables.history import RunnableWithMessageHistory
+from langchain_community.chat_message_histories import ChatMessageHistory
+from langchain_core.output_parsers import StrOutputParser
+from langchain_text_splitters import RecursiveCharacterTextSplitter
+from langchain_core.documents import Document
+from utils.config import Config
+from utils.db_full_schema import get_full_db_schema, search_db_metadata, get_all_table_names
 
 # -----------------------------------------------------------------
-# 👇 임베딩 모델을 전역으로 한 번만 로드합니다.
+# 1. 모델 및 임베딩 초기화
 # -----------------------------------------------------------------
-try:
-    print("🧠 임베딩 모델 로드 중... (multilingual-e5-large)")
-    embeddings = HuggingFaceEmbeddings(model_name=embedding_model_path)
-    print("✅ 임베딩 모델 로드 완료.")
-except Exception as e:
-    print(f"🚫 FATAL: 임베딩 모델 로드 실패: {e}")
-    embeddings = None
+llm = ChatOllama(
+    model="gpt-oss:20b-cloud",
+    temperature=0.1, 
+    base_url="http://localhost:11434"
+)
+
+embeddings = HuggingFaceEmbeddings(model_name="C:\\Users\\User\\.cache\\huggingface\\hub\\models--intfloat--multilingual-e5-large\\snapshots\\0dc5580a448e4284468b8909bae50fa925907bc5")
+
 # -----------------------------------------------------------------
+# 2. 대화 기록 저장소 (In-Memory for Test)
+# -----------------------------------------------------------------
+store = {}
 
+def get_session_history(session_id: str):
+    """테스트용 메모리 저장소 (서버 재시작 시 초기화됨)"""
+    if session_id not in store:
+        store[session_id] = ChatMessageHistory()
+    return store[session_id]
 
-# PDF → 텍스트 변환
-def extract_text_from_pdf(path: str) -> str:
-    text = ""
-    with open(path, "rb") as f:
-        reader = PdfReader(f)
-        for page in reader.pages:
-            page_text = page.extract_text()
-            if page_text:
-                cleaned = page_text.replace("-\n", "").replace("\n", " ").strip()
-                text += cleaned + "\n"
-    print(f"[PDF] 전체 페이지 수: {len(reader.pages)} / 추출 완료")
+# -----------------------------------------------------------------
+# 3. 초기화 함수 (서버 시작 시 호출)
+# -----------------------------------------------------------------
+# utils/ollama_rag.py
 
-    return text
-
-def save_text(text: str, path: str):
-    with open(path, "w", encoding="utf-8") as f:
-        f.write(text)
-
-# Vectorstore 구축/로딩 (타입 1용)
-def create_vectorstore():
-    global vectorstore
-    global embeddings # 👈  전역 임베딩 사용
+def initialize_vectorstore():
+    """앱 시작 시 벡터 스토어가 존재하는지 확인하고, 없으면 생성합니다."""
+    print("🚀 [초기화] DB 스키마 벡터 스토어 확인 중...")
     
-    if embeddings is None:
-        print("🚫 ERROR: 임베딩 모델이 로드되지 않아 Vectorstore를 생성할 수 없습니다.")
+    try:
+        # 1. 벡터 스토어 파일(index.faiss)이 이미 있는지 확인
+        index_path = os.path.join(Config.SCHEMA_STORE_PATH, "index.faiss")
+
+        if os.path.exists(Config.SCHEMA_STORE_PATH) and os.path.exists(index_path):
+            print(f"✅ [초기화 스킵] 기존 벡터 스토어가 발견되었습니다. (경로: {Config.SCHEMA_STORE_PATH})")
+            print("   (※ DB 변경 사항을 반영하려면 'data/schema_store' 폴더를 삭제 후 재시작하세요.)")
+            return
+
+        # 2. 없으면 생성 로직 수행
+        print("⚡ 기존 스토어가 없습니다. DB 스키마 추출 및 벡터화를 시작합니다...")
+
+        docs = get_full_db_schema()
+        if not docs:
+            print("⚠️ [초기화 주의] DB에서 추출된 객체가 없습니다.")
+            return
+
+        print(f"   - 추출된 DB 객체 수: {len(docs)}개")
+
+        lc_docs = [Document(page_content=d["content"], metadata={"name": d["name"]}) for d in docs]
+        
+        splitter = RecursiveCharacterTextSplitter(chunk_size=2000, chunk_overlap=200)
+        split_docs = splitter.split_documents(lc_docs)
+        
+        vectorstore = FAISS.from_documents(split_docs, embeddings)
+        vectorstore.save_local(Config.SCHEMA_STORE_PATH)
+        print("✅ [초기화 완료] DB 벡터화 및 저장 성공!")
+        
+    except Exception as e:
+        print(f"❌ [초기화 실패] 오류 발생: {e}")
+
+# -----------------------------------------------------------------
+# 4. 벡터 리트리버 관리
+# -----------------------------------------------------------------
+def get_db_retriever():
+    if os.path.exists(os.path.join(Config.SCHEMA_STORE_PATH, "index.faiss")):
+        vectorstore = FAISS.load_local(Config.SCHEMA_STORE_PATH, embeddings, allow_dangerous_deserialization=True)
+        return vectorstore.as_retriever(search_kwargs={"k": 10})
+    else:
+        print("⚠️ 벡터 스토어가 없습니다. (초기화 실패 가능성)")
         return None
 
-    if not os.path.exists(txt_path):
-        print("📄 PDF에서 텍스트 추출 중...")
-        extracted = extract_text_from_pdf(pdf_path)
-        save_text(extracted, txt_path)
-    with open(txt_path, "r", encoding="utf-8") as f:
-        raw_text = f.read()
-
-    splitter = RecursiveCharacterTextSplitter(
-        chunk_size=1600, chunk_overlap=300, separators=["\n\n", "\n", ".", " "]
-    )
-
-    documents = splitter.create_documents([raw_text])
-    print(f"📑 문서 분할: 전체 {len(documents)}개")
-    filtered_docs = [doc for doc in documents if len(doc.page_content.strip()) > 80]
-    print(f"✅ 필터 후 문서: {len(filtered_docs)}개")
+# -----------------------------------------------------------------
+# 5. 키워드 추출용 (의도 파악)
+# -----------------------------------------------------------------
+def extract_keyword(question: str):
+    prompt = f"""
+    당신은 DB 검색 쿼리 추출기입니다.
+    질문: '{question}'
     
-    # 👈 전역 임베딩을 사용하므로 이 라인 삭제
-    # embeddings = HuggingFaceEmbeddings(model_name=embedding_model_path)
-
-    if not os.path.exists(vectorstore_path):
-        print("💾 FAISS 벡터스토어 생성 중...")
-        vectorstore = FAISS.from_documents(filtered_docs, embeddings)
-        vectorstore.save_local(vectorstore_path)
-    else:
-        print("📦 FAISS 벡터스토어 로드 중...")
-        vectorstore = FAISS.load_local(vectorstore_path, embeddings, allow_dangerous_deserialization=True)
-
-    return vectorstore
-
-def build_context_for_question(question: str, k=20, score_threshold=0.4):
-    # 👈 vectorstore가 None일 때 방어 코드
-    if vectorstore is None:
-        return "ERROR: 전력거래시장 Vectorstore가 로드되지 않았습니다."
-
-    results = vectorstore.similarity_search_with_score(question, k=k)
-
-    # score 오름차순 정렬
-    results.sort(key=lambda x: x[1])
-
-    # score 필터링
-    filtered = [(doc, score) for doc, score in results if score <= score_threshold]
-
-    if not filtered:
-        return "관련 문서를 찾을 수 없습니다."
-
-    context_parts = [
-        f"[score={score:.4f}]\n{doc.page_content}"
-        for doc, score in filtered
-    ]
-
-    return "\n\n".join(context_parts)
-
-custom_prompt = PromptTemplate.from_template(
-"""
-너는 '전력거래시장 규칙' 전문 기반의 RAG QA 전문가다.
-아래 [문서 내용]을 참고하여 [질문]에 대해 아래의 답변 형식과 규칙에 따라 답변하라.
-
-[답변 형식 예시]
-1. 정의
-(질문에 해당하는 공식/수식이 있으면 반드시 그대로 복사해 답변하라. 문서 내에서 일치하는 공식/수식이 없으면 "문서에서 확인할 수 없습니다."라고 답변하라.)
-
-2. 설명
-A. (조건/예외명)
-(수식 및 설명)
-...
-
-[답변 작성 규칙]
-- 1번 항목(정의)에는 질문에 해당하는 공식/수식만 반드시 그대로 복사해 답변하라.
-- 중간 변수(ex: MP, GP, TLF 등)는 그대로 두고, 내부 수식은 확장하지 말라.
-- 공식/수식은 반드시 문서 내 등장한 그 모습 그대로 복사해라.
-- 추론, 변형, 해석, 요약, 다른 용어로의 변환 모두 절대 하지 말라.
-- 답변 마지막에 **[END]**만 출력하라.
-
-[문서 내용]
-{context}
-
-[질문]
-{question}
-"""
-)
-
-custom_prompt2 = PromptTemplate.from_template(
-"""
-너는 '전력거래시장 규칙' 전문 기반의 RAG QA 전문가다.
-아래 [문서 내용]을 바탕으로 [질문]에 대해 답변하라.
-공식/수식은 절대 변경하지말고, 문서 내용에 나온 그대로 답변하라.
-
-[문서 내용]
-{context}
-
-[질문]
-{question}
-"""
-)
-
-
-def query_ollama(prompt: str, model: str = "gpt-oss-20b") -> str:
-    url = "http://localhost:11434/api/generate"
-    headers = {"Content-Type": "application/json"}
-    data = {
-        "model": model,
-        "prompt": prompt,
-        "stream": False,
-        "options": {
-            "temperature": 0.4,           # 창의성 최소화, 결정적 답변
-            #"top_k": 40,                  # 후보군 좁게
-            #"top_p": 0.7,                # 확률 상위 85%만 후보
-            #"repeat_penalty": 1.15,       # 반복 억제
-            #"presence_penalty": 1.2,      # 중복 억제
-            #"frequency_penalty": 1.1,     # 자주 등장 단어 억제
-            #"penalize_newline": True,     # 줄바꿈 반복 억제
-            "num_predict": 2024,           # 충분한 길이
-            "num_ctx": 32768,              # 가능한 한 크게 (모델 한계까지)
-            "stop": ["[END]", "<|end_of_text|>"] # 필요시 프롬프트 종료 문자 지정
-        }
-    }
-
-    try:
-        res = requests.post(url, headers=headers, json=data, timeout=180)
-        res.raise_for_status()
-        answer = res.json().get("response", "").strip()
-        return answer if answer else "문서에서 관련된 정보를 찾을 수 없습니다."
-    except requests.exceptions.RequestException as e:
-        return f"🚫 Ollama 오류: {e}"
-
-def clean_ollama_answer(raw_answer: str):
-    stop_tokens = ["[END]", "<|end_of_text|>"]
-    min_idx = len(raw_answer)
-
-    for token in stop_tokens:
-        idx = raw_answer.find(token)
-        if idx != -1:
-            min_idx = min(min_idx, idx + len(token))
-
-    return raw_answer[:min_idx].strip()
-
-# --- (기존 타입 1 함수) ---
-def rag_with_ollama(question: str, query_type: str):
-
-    if query_type in ("0", "1"):
-        context_str = build_context_for_question(question, k=12)
-    else:
-        context_str = ""
-
-    if str(query_type) == "0":
-        prompt = custom_prompt.format(context=context_str, question=question)
-    elif str(query_type) == "1":
-        prompt = custom_prompt2.format(context=context_str, question=question)
-    else:
-        prompt = f"[질문]\n{question}"
-
+    1. 사용자가 특정 테이블명, 컬럼명, 또는 비즈니스 용어(예: MEP, 인사, 급여 등)를 찾고 있다면 그 '핵심 단어' 하나만 출력하세요.
+    2. '테이블', '목록', '전체', '보여줘' 같은 일반적인 요청 단어는 무시하세요.
+    3. 검색할 구체적 대상이 없다면 "FALSE"라고만 출력하세요.
     
-
-    print(f"\n📝 최종 Prompt (타입 1):\n{prompt}\n")
-    answer = query_ollama(prompt)
-    print(f"\n🔍 질문: {question}\n💡 답변: {answer}")
-
-    return {
-        "rag_context": context_str,
-        "answer": clean_ollama_answer(answer)
-    }
-
-# -----------------------------------------------------------------
-# 👇  타입 2 (파일 RAG)를 위한 프롬프트와 함수
-# -----------------------------------------------------------------
-
-# ✅ 3. 파일 RAG를 위한 새 프롬프트 (custom_prompt3)
-custom_prompt3 = PromptTemplate.from_template(
-"""
-너는 주어진 [문서 내용]을 바탕으로 [질문]에 대해 답변하는 QA 전문가다.
-[문서 내용]을 벗어나는 내용은 답변하지 말고, 내용을 요약하거나 추론하여 답변하라.
-
-[문서 내용]
-{context}
-
-[질문]
-{question}
-"""
-)
-
-# -----------------------------------------------------------------
-# 👇 'rag_with_context' (타입 2) 함수 로직 전체 수정
-# -----------------------------------------------------------------
-def rag_with_context(question: str, context: str):
+    Output example:
+    - "MEP 테이블 있어?" -> MEP
+    - "전체 테이블 리스트 줘" -> FALSE
+    - "사용자 정보 어디 있어?" -> 사용자
     """
-    업로드된 파일에서 추출한 텍스트(context)를 기반으로
-    "인메모리(In-memory) RAG"를 수행합니다. (Context Stuffing 대신)
-    """
-    global embeddings # 👈 전역 임베딩 사용
-    
-    if embeddings is None:
-        return {
-            "rag_context": "ERROR: Embedding 모델이 로드되지 않았습니다.",
-            "answer": "Embedding 모델 로드 실패로 답변할 수 없습니다."
-        }
+    return llm.invoke(prompt).content.strip()
 
-    print(f"🧠 'Type 2' (파일 RAG) 시작. 원본 텍스트 {len(context)}자.")
+# -----------------------------------------------------------------
+# 6. 통합 RAG 실행 함수 (Hybrid Search 적용)
+# -----------------------------------------------------------------
+def rag_with_history(question: str, session_id: str = "default"):
     
-    # 1. 텍스트 분할 (Split)
-    splitter = RecursiveCharacterTextSplitter(
-        chunk_size=1600, chunk_overlap=300, separators=["\n\n", "\n", ".", " "]
-    )
-    documents = splitter.create_documents([context])
-    print(f"📑 업로드된 파일 {len(documents)}개 청크로 분할됨.")
-
-    if not documents:
-        return {
-            "rag_context": "N/A",
-            "answer": "파일을 분할(Chunking)했으나 유효한 텍스트가 없습니다."
-        }
-
-    # 2. 인메모리 Vectorstore 생성 (Embed & Store)
-    print("💾 인메모리(In-memory) FAISS 벡터스토어 생성 중...")
-    try:
-        # 👈 [핵심] 업로드된 문서로 실시간(임시) 벡터스토어 생성
-        temp_vectorstore = FAISS.from_documents(documents, embeddings)
-        print("📦 인메모리 벡터스토어 생성 완료.")
-    except Exception as e:
-        print(f"🚫 ERROR: 인메모리 벡터스토어 생성 실패: {e}")
-        return {
-            "rag_context": f"Error: {e}",
-            "answer": f"파일 벡터스토어 생성 중 오류가 발생했습니다: {e}"
-        }
-
-    # 3. 질문이 없으면 요약으로 처리
-    if not question or question.strip() == "":
-        question = "제공된 문서의 내용을 요약해줘."
-
-    # 4. 검색 (Retrieve) - 관련된 청크(조각) 찾기
-    print(f"🔍 벡터 검색 수행 (질문: {question})...")
-    k_val = 12 # 12개의 관련 조각을 검색
+    retrieved_context = ""
     
-    results = temp_vectorstore.similarity_search_with_score(question, k=k_val)
+    # 1. [우선순위 1] 키워드 추출 (의도 파악)
+    # 질문에 특정 대상(MEP, USER 등)이 있는지 먼저 확인합니다.
+    keyword = extract_keyword(question)
     
-    # 5. 컨텍스트 생성 (Build Context)
-    results.sort(key=lambda x: x[1]) # Score 기준 정렬 (낮을수록 좋음)
-    
-    # (임계값 필터링 - 필요시 활성화)
-    # score_threshold = 0.5 
-    # filtered = [(doc, score) for doc, score in results if score <= score_threshold]
-    filtered = results # (일단 Top-K 모두 사용)
-    
-    if not filtered:
-        context_str = "관련 문서를 찾을 수 없습니다."
-    else:
-        context_parts = [
-            f"[score={score:.4f}]\n{doc.page_content}"
-            for doc, score in filtered
-        ]
-        context_str = "\n\n".join(context_parts)
+    # 2. 로직 분기 처리
+    if keyword != "FALSE" and len(keyword) > 1:
+        # (A) 구체적인 검색어가 있는 경우 (예: "MEP 테이블 찾아줘", "MEP가 포함된 전체 테이블")
+        print(f"🔎 메타데이터 조건 검색 수행: '{keyword}'")
+        meta_result = search_db_metadata(keyword)
+        retrieved_context += f"\n[DB 메타데이터 검색 결과 (키워드: {keyword})]\n{meta_result}\n"
         
-    print(f"✅ RAG 컨텍스트 생성 완료 (총 {len(context_str)}자).")
+        # 필요하다면 여기서 벡터 검색도 병행 가능 (Hybrid)
+        retriever = get_db_retriever()
+        if retriever:
+            docs = retriever.invoke(question)
+            vec_result = "\n\n".join([f"--- {d.metadata.get('name')} ---\n{d.page_content}" for d in docs])
+            retrieved_context += f"\n[관련 스키마 정보 (유사도 검색)]\n{vec_result}\n"
 
-    # 6. LLM에 질문 (Generate)
-    prompt = custom_prompt3.format(context=context_str, question=question)
+    elif any(x in question for x in ["전체 테이블", "모든 테이블", "테이블 목록", "테이블 리스트"]):
+        # (B) 검색어는 없는데 '전체'를 달라고 한 경우 (예: "그냥 전체 테이블 다 보여줘")
+        print("💡 조건 없는 전체 목록 조회 요청 감지")
+        retrieved_context = f"[전체 테이블 목록]\n{get_all_table_names()}"
+        
+    else:
+        # (C) 그 외 일반적인 질문 -> 벡터 검색만 수행
+        print("📚 일반 RAG 검색 수행")
+        retriever = get_db_retriever()
+        if retriever:
+            docs = retriever.invoke(question)
+            vec_result = "\n\n".join([f"--- {d.metadata.get('name')} ---\n{d.page_content}" for d in docs])
+            retrieved_context += f"\n[관련 스키마 정보 (유사도 검색)]\n{vec_result}\n"
 
-    #print(f"\n📝 최종 Prompt (파일 RAG):\n{prompt}\n")
+    system_prompt = """너는 Oracle Database 전문가이자 데이터 분석가다.
+                        아래 제공된 [참고 정보]와 [대화 기록]을 바탕으로 사용자의 질문에 답변하라.
+                        - [DB 메타데이터 검색 결과]가 있다면 그 정보를 최우선으로 사용하여 테이블 이름을 정확히 답변하라.
+                        - 질문이 특정 테이블이나 컬럼을 찾고 있다면, 정확한 이름을 제시하라.
+                    """
+
+    prompt = ChatPromptTemplate.from_messages([
+        ("system", system_prompt),
+        ("system", "[참고 정보]\n{context}"),
+        MessagesPlaceholder(variable_name="chat_history"),
+        ("human", "{question}"),
+    ])
+
+    chain = prompt | llm | StrOutputParser()
+
+    chain_with_history = RunnableWithMessageHistory(
+        chain,
+        get_session_history,
+        input_messages_key="question",
+        history_messages_key="chat_history",
+    )
+
+    print(f"🔍 질문(Session={session_id}): {question}")
     
-    # Ollama 호출 (기존 함수 재활용)
-    answer = query_ollama(prompt)
+    final_context = retrieved_context if retrieved_context.strip() else "제공된 문서나 DB 정보가 없습니다. 일반적인 지식으로 답변합니다."
     
-    print(f"\n🔍 질문: {question}\n💡 답변: {answer}")
-
+    answer = chain_with_history.invoke(
+        {"question": question, "context": final_context},
+        config={"configurable": {"session_id": session_id}}
+    )
+    
     return {
-        "rag_context": context_str, # (디버깅/참고용으로 컨텍스트 반환)
-        "answer": clean_ollama_answer(answer)
-    }
-
-# -----------------------------------------------------------------
-# 👇 타입 2 (파일 없음)를 위한 LLM 직접 호출 함수
-# -----------------------------------------------------------------
-def ask_llm_only(question: str):
-    """
-    RAG 없이 질문(prompt)만 LLM에 직접 전달하여 답변을 받습니다.
-    """
-    
-    # RAG가 없는 간단한 프롬프트 형식
-    prompt = f"[질문]\n{question}"
-    
-    print(f"\n📝 최종 Prompt (LLM Only):\n{prompt}\n")
-
-    # Ollama 호출 (기존 함수 재활용)
-    answer = query_ollama(prompt)
-    
-    print(f"\n🔍 질문: {question}\n💡 답변: {answer}")
-
-    # 프론트엔드가 동일한 {answer, rag_context} 형식을 기대할 수 있으므로
-    # 'rag_context'는 비워두고 형식을 맞춥니다.
-    return {
-        "rag_context": "N/A (LLM 직접 호출)",
-        "answer": clean_ollama_answer(answer)
+        "answer": answer
     }
